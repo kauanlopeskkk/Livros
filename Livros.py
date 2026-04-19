@@ -2,31 +2,67 @@ from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
-from sqlalchemy import create_engine, Column, Integer, String , Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-import redis.asyncio as redis
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+import redis
 import json
 import os
 import logging
 
 logging.basicConfig(level=logging.INFO)
 
+
+# =========================
+# DATABASE
+# =========================
+
 DATABASE_URL = "sqlite:///./livros.db"
 
-Engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=Engine)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
 Base = declarative_base()
 
-redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
-senha_admin = os.getenv("SENHA_ADMIN", "admin")  
-senha = os.getenv("SENHA", "1010")
+# =========================
+# REDIS
+# =========================
 
-app = FastAPI(title="Livros API Criando com sucesso")
+redis_client = redis.Redis(
+    host="localhost",
+    port=6379,
+    decode_responses=True
+)
+
+
+# =========================
+# CREDENCIAIS
+# =========================
+
+usuario_admin = os.getenv("USUARIO_ADMIN", "admin")
+senha_admin = os.getenv("SENHA_ADMIN", "1010")
+
+
+# =========================
+# FASTAPI
+# =========================
+
+app = FastAPI(title="API de Livros")
 
 security = HTTPBasic()
 
+
+# =========================
+# MODEL SQLALCHEMY
+# =========================
 
 class Livro(Base):
     __tablename__ = "livros"
@@ -38,8 +74,12 @@ class Livro(Base):
     preco = Column(Float, index=True)
 
 
-Base.metadata.create_all(bind=Engine)
+Base.metadata.create_all(bind=engine)
 
+
+# =========================
+# MODEL PYDANTIC
+# =========================
 
 class LivroCreate(BaseModel):
     titulo: str
@@ -47,12 +87,32 @@ class LivroCreate(BaseModel):
     ano_publicacao: int
     preco: float
 
-async def salvar_livro_redis(Livro_id:int , Livro: LivroCreate):
-    await redis_client.set(f"Livro:{Livro_id}", json.dumps(Livro.dict()))
 
-async def deletar_livro_redis(Livro_id: int):
-    await redis_client.delete(f"Livro:{Livro_id}")
+# =========================
+# REDIS HELPERS
+# =========================
 
+def salvar_livro_redis(livro_id: int, livro: LivroCreate):
+    redis_client.set(
+        f"Livro:{livro_id}",
+        json.dumps(livro.dict())
+    )
+
+
+def deletar_livro_redis(livro_id: int):
+    redis_client.delete(
+        f"Livro:{livro_id}"
+    )
+
+
+def limpar_cache():
+    for key in redis_client.scan_iter("Livros:*"):
+        redis_client.delete(key)
+
+
+# =========================
+# DB SESSION
+# =========================
 
 def sessao_db():
     db = SessionLocal()
@@ -62,11 +122,24 @@ def sessao_db():
         db.close()
 
 
-def autenticar_usuario(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, senha_admin)
-    correct_password = secrets.compare_digest(credentials.password, senha)
+# =========================
+# AUTH
+# =========================
 
-    if not (correct_username and correct_password):
+def autenticar_usuario(
+    credentials: HTTPBasicCredentials = Depends(security)
+):
+    usuario_correto = secrets.compare_digest(
+        credentials.username,
+        usuario_admin
+    )
+
+    senha_correta = secrets.compare_digest(
+        credentials.password,
+        senha_admin
+    )
+
+    if not (usuario_correto and senha_correta):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciais inválidas",
@@ -76,43 +149,60 @@ def autenticar_usuario(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
+# =========================
+# ROOT
+# =========================
+
 @app.get("/")
 def read_root():
-    return {"message": "Bem-vindo à API de Livros!"}
+    return {
+        "message": "Bem-vindo à API de Livros!"
+    }
 
+
+# =========================
+# DEBUG REDIS
+# =========================
 
 @app.get("/debug/redis")
-async def ver_livros_redis():
-    chaves = redis_client.scan("Livro:*")
+def ver_livros_redis():
     livros = []
 
-    for chave in chaves:
-        valor = await redis_client.get(chave)
-        ttl = await redis_client.ttl(chave)
+    for chave in redis_client.scan_iter("Livro:*"):
+        valor = redis_client.get(chave)
+        ttl = redis_client.ttl(chave)
+
         livros.append({
             "chave": chave,
             "valor": json.loads(valor),
             "ttl": ttl
         })
-    return {"livros_redis": livros}
+
+    return {
+        "livros_redis": livros
+    }
 
 
+# =========================
+# CREATE
+# =========================
 
-@app.post("/Livros/")
-async def Criar_livro(
+@app.post("/livros/")
+def criar_livro(
     livro: LivroCreate,
     db: Session = Depends(sessao_db),
-    credentials: HTTPBasicCredentials = Depends(autenticar_usuario)
+    _: HTTPBasicCredentials = Depends(autenticar_usuario)
 ):
     db_livro = db.query(Livro).filter(
-        (Livro.titulo == livro.titulo) &
-        (Livro.autor == livro.autor) &
-        (Livro.ano_publicacao == livro.ano_publicacao) &
-        (Livro.preco == livro.preco)
+        Livro.titulo == livro.titulo,
+        Livro.autor == livro.autor
     ).first()
 
     if db_livro:
-        raise HTTPException(status_code=400, detail="Livro já existe NA ID")
+        raise HTTPException(
+            status_code=400,
+            detail="Livro já existe"
+        )
 
     novo_livro = Livro(
         titulo=livro.titulo,
@@ -121,13 +211,16 @@ async def Criar_livro(
         preco=livro.preco
     )
 
-
-
     db.add(novo_livro)
     db.commit()
     db.refresh(novo_livro)
 
-    await salvar_livro_redis(novo_livro.id, livro)
+    salvar_livro_redis(
+        novo_livro.id,
+        livro
+    )
+
+    limpar_cache()
 
     return {
         "id": novo_livro.id,
@@ -138,28 +231,45 @@ async def Criar_livro(
     }
 
 
-@app.get("/Livros/")
-async def listar_livros(
+# =========================
+# READ
+# =========================
+
+@app.get("/livros/")
+def listar_livros(
     page: int = 1,
     size: int = 10,
     db: Session = Depends(sessao_db),
-    credentials: HTTPBasicCredentials = Depends(autenticar_usuario)
+    _: HTTPBasicCredentials = Depends(autenticar_usuario)
 ):
-    if page < 1 or size <1:
-        raise HTTPException(status_code=400, detail="Page e size devem ser maiores que 0")
+    if page < 1 or size < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Page e size devem ser maiores que 0"
+        )
+
     cache_key = f"Livros:page={page}:size={size}"
-    cached = redis_client.get(cache_key)    
+
+    cached = redis_client.get(cache_key)
+
     if cached:
         return json.loads(cached)
-    livros = db.query(Livro).offset((page - 1) * size).limit(size).all()    
+
+    livros = db.query(Livro)\
+        .offset((page - 1) * size)\
+        .limit(size)\
+        .all()
 
     if not livros:
-        raise HTTPException(status_code=404, detail="Nenhum livro encontrado")
-    
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum livro encontrado"
+        )
+
     total_livros = db.query(Livro).count()
-    
-    reposta = {
-        "page": page, 
+
+    resposta = {
+        "page": page,
         "size": size,
         "total": total_livros,
         "livros": [
@@ -174,21 +284,35 @@ async def listar_livros(
         ]
     }
 
-    redis_client.setex(cache_key, 600, json.dumps(reposta))
+    redis_client.setex(
+        cache_key,
+        600,
+        json.dumps(resposta)
+    )
 
-    return reposta
+    return resposta
 
-@app.put("/Livros/{livro_id}")
-async def atualizar_livro(
+
+# =========================
+# UPDATE
+# =========================
+
+@app.put("/livros/{livro_id}")
+def atualizar_livro(
     livro_id: int,
     livro: LivroCreate,
     db: Session = Depends(sessao_db),
-    credentials: HTTPBasicCredentials = Depends(autenticar_usuario)
+    _: HTTPBasicCredentials = Depends(autenticar_usuario)
 ):
-    db_livro = db.query(Livro).filter(Livro.id == livro_id).first()
+    db_livro = db.query(Livro).filter(
+        Livro.id == livro_id
+    ).first()
 
     if not db_livro:
-        raise HTTPException(status_code=404, detail="Livro não encontrado")
+        raise HTTPException(
+            status_code=404,
+            detail="Livro não encontrado"
+        )
 
     db_livro.titulo = livro.titulo
     db_livro.autor = livro.autor
@@ -198,39 +322,40 @@ async def atualizar_livro(
     db.commit()
     db.refresh(db_livro)
 
-
-    for key in redis_client.scan_iter("Livros:*"):
-        redis_client.delete(key)
-
-    await salvar_livro_redis(livro_id, livro)
+    limpar_cache()
+    salvar_livro_redis(livro_id, livro)
 
     return {
-        "id": db_livro.id,
-        "titulo": db_livro.titulo,
-        "autor": db_livro.autor,
-        "ano_publicacao": db_livro.ano_publicacao,
-        "preco": db_livro.preco
+        "message": "Livro atualizado com sucesso"
     }
 
 
-@app.delete("/Livros/{livro_id}")
-async def deletar_livro(
+# =========================
+# DELETE
+# =========================
+
+@app.delete("/livros/{livro_id}")
+def deletar_livro(
     livro_id: int,
     db: Session = Depends(sessao_db),
-    credentials: HTTPBasicCredentials = Depends(autenticar_usuario)
+    _: HTTPBasicCredentials = Depends(autenticar_usuario)
 ):
-    db_livro = db.query(Livro).filter(Livro.id == livro_id).first()
+    db_livro = db.query(Livro).filter(
+        Livro.id == livro_id
+    ).first()
 
     if not db_livro:
-        raise HTTPException(status_code=404, detail="Livro não encontrado")
+        raise HTTPException(
+            status_code=404,
+            detail="Livro não encontrado"
+        )
 
     db.delete(db_livro)
     db.commit()
 
-    # Invalidar cache
-    for key in redis_client.keys("Livros:*"):
-        redis_client.delete(key)
+    limpar_cache()
+    deletar_livro_redis(livro_id)
 
-    await deletar_livro_redis(livro_id)
-
-    return {"message": "Livro deletado com sucesso"}
+    return {
+        "message": "Livro deletado com sucesso"
+    }
